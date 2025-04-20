@@ -4,6 +4,10 @@ import random
 from datetime import datetime, timedelta
 import seaborn as sns
 import matplotlib.pyplot as plt
+# import kagglehub
+# # Download latest version
+# path = kagglehub.dataset_download("maharshipandya/-spotify-tracks-dataset")
+# print("Path to dataset files:", path)
 
 # -------------------------------
 # MODULE 1: DATA INGESTION & STORAGE
@@ -146,6 +150,21 @@ def preprocess_data(raw_data):
     interactions_df = raw_data['interactions'].dropna()
     context_df = raw_data['context'].dropna()
     tracks_df = raw_data['tracks'].dropna()
+    
+    # Rename 'artists' column to 'artist_name' if it exists
+    if 'artists' in tracks_df.columns and 'artist_name' not in tracks_df.columns:
+        tracks_df['artist_name'] = tracks_df['artists']
+        print("Renamed 'artists' column to 'artist_name'")
+    
+    # Check if required columns exist in tracks_df
+    required_columns = ['track_id', 'artist_name', 'track_name']
+    missing_columns = [col for col in required_columns if col not in tracks_df.columns]
+    
+    if missing_columns:
+        print(f"Warning: Missing columns in track data: {missing_columns}")
+        # Add missing columns with placeholder values
+        for col in missing_columns:
+            tracks_df[col] = f"Unknown {col.replace('_', ' ').title()}"
     
     # Merge interactions with context using nearest timestamp (within 1 minute tolerance)
     merged_df = pd.merge_asof(
@@ -420,3 +439,4 @@ def main():
 # -------------------------------
 if __name__ == "__main__":
     main()
+
