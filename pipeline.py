@@ -18,7 +18,7 @@ def load_spotify_track_metadata(filename="spotify_data.csv"):
     Expected columns (for example):
       - track_id
       - track_name
-      - artist_name
+      - artist
       - album_name
       - release_date
       - popularity
@@ -151,13 +151,10 @@ def preprocess_data(raw_data):
     context_df = raw_data['context'].dropna()
     tracks_df = raw_data['tracks'].dropna()
     
-    # Rename 'artists' column to 'artist_name' if it exists
-    if 'artists' in tracks_df.columns and 'artist_name' not in tracks_df.columns:
-        tracks_df['artist_name'] = tracks_df['artists']
-        print("Renamed 'artists' column to 'artist_name'")
+    tracks_df['artists']
     
     # Check if required columns exist in tracks_df
-    required_columns = ['track_id', 'artist_name', 'track_name']
+    required_columns = ['track_id', 'artists', 'track_name']
     missing_columns = [col for col in required_columns if col not in tracks_df.columns]
     
     if missing_columns:
@@ -176,20 +173,20 @@ def preprocess_data(raw_data):
         tolerance=pd.Timedelta("1min")
     )
     
-    # Merge with Spotify track metadata to obtain 'artist_name' and 'track_name'
-    merged_df = pd.merge(merged_df, tracks_df[['track_id', 'artist_name', 'track_name']], on='track_id', how='left')
+    # Merge with Spotify track metadata to obtain 'artists' and 'track_name'
+    merged_df = pd.merge(merged_df, tracks_df[['track_id', 'artists', 'track_name']], on='track_id', how='left')
     
     # Debug: Show merged DataFrame structure
     print("Merged DataFrame after merging interactions and context:")
     print(merged_df.head())
     print("Columns in merged_df:", merged_df.columns.tolist())
     
-    # Validate that 'artist_name' exists; if missing, fill with 'Unknown Artist'
-    if 'artist_name' not in merged_df.columns:
-        raise ValueError("'artist_name' column is missing after merging. Check the Spotify dataset.")
-    elif merged_df['artist_name'].isna().any():
-        print("Warning: Some tracks have missing artist_name. Filling with 'Unknown Artist'.")
-        merged_df['artist_name'] = merged_df['artist_name'].fillna('Unknown Artist')
+    # Validate that 'artists' exists; if missing, fill with 'Unknown Artist'
+    if 'artists' not in merged_df.columns:
+        raise ValueError("'artists' column is missing after merging. Check the Spotify dataset.")
+    elif merged_df['artists'].isna().any():
+        print("Warning: Some tracks have missing artists. Filling with 'Unknown Artist'.")
+        merged_df['artists'] = merged_df['artists'].fillna('Unknown Artist')
     
     # Compute session_id: start a new session if time difference > 5 minutes (300 sec)
     merged_df = merged_df.sort_values(['user_id', 'timestamp'])
@@ -210,7 +207,7 @@ def visualize_raw_analytics(processed_df):
       - Leaderboard: Total interactions per artist.
     """
     # Validate required columns
-    required_columns = ['timestamp', 'artist_name']
+    required_columns = ['timestamp', 'artists']
     missing_cols = [col for col in required_columns if col not in processed_df.columns]
     if missing_cols:
         raise ValueError(f"Missing required columns in processed data: {missing_cols}")
@@ -230,9 +227,9 @@ def visualize_raw_analytics(processed_df):
     plt.show()
     
     # Leaderboard: Total interactions per artist
-    leaderboard = processed_df.groupby('artist_name').size().reset_index(name='total_interactions')
+    leaderboard = processed_df.groupby('artists').size().reset_index(name='total_interactions')
     plt.figure(figsize=(10, 4))
-    sns.barplot(x='artist_name', y='total_interactions', data=leaderboard)
+    sns.barplot(x='artists', y='total_interactions', data=leaderboard)
     plt.title("Artist Leaderboard")
     plt.xlabel("Artist")
     plt.ylabel("Total Interactions")
@@ -282,10 +279,10 @@ def build_interaction_graph(processed_df, fused_features, track_metadata):
     """
     users = set(processed_df['user_id'].unique())
     tracks = set(processed_df['track_id'].unique())
-    artists = set(processed_df['artist_name'].unique())
+    artists = set(processed_df['artists'].unique())
     
     # Build track-to-artist mapping from the Spotify track metadata
-    track_to_artist = dict(zip(track_metadata['track_id'], track_metadata['artist_name']))
+    track_to_artist = dict(zip(track_metadata['track_id'], track_metadata['artists']))
     
     # Build edges: (user_id, track_id, weight) based on interaction action
     edges = []
@@ -373,7 +370,7 @@ def compute_leaderboard(graph):
     """
     Compute a leaderboard based on aggregated weighted edges per artist.
     Returns:
-      - sorted_leaderboard: List of tuples (artist_name, total_score) sorted in descending order.
+      - sorted_leaderboard: List of tuples (artists, total_score) sorted in descending order.
     """
     artist_scores = {}
     for (user, track, weight) in graph['weighted_edges']:
