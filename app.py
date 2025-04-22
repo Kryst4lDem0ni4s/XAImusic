@@ -960,23 +960,59 @@ def get_track_details_from_musicbrainz(track_id):
         return None
 
 def get_track_details(track_id):
-    """Get track details, trying ReccoBeats first, then falling back to MusicBrainz"""
-    # Try ReccoBeats first
+    """Get track details with improved fallback mechanisms"""
+    # Check if the ID looks like a Spotify ID (base62 string)
+    is_spotify_id = len(track_id) == 22 and all(c in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" for c in track_id)
+    
+    # Try to get from our local cache first (database)
+    conn = sqlite3.connect('music_app.db')
+    cursor = conn.cursor()
+    
+    # Check in favorites, playlist_tracks, and recently_played tables
+    for table in ['user_favorites', 'playlist_tracks', 'recently_played', 'queue']:
+        cursor.execute(f'SELECT track_name, artists, album_art FROM {table} WHERE track_id = ? LIMIT 1', (track_id,))
+        result = cursor.fetchone()
+        if result and result[0]:  # If we found a match with actual data
+            conn.close()
+            return {
+                "id": track_id,
+                "title": result[0],
+                "artist": result[1],
+                "album_art": result[2] or f"https://picsum.photos/seed/{track_id}/300/300"
+            }
+    
+    conn.close()
+    
+    # If it's a Spotify-like ID, try to get from Spotify dataset
+    if is_spotify_id and hasattr(st.session_state, 'user_data') and st.session_state.user_data:
+        tracks_df = st.session_state.user_data.get('tracks', pd.DataFrame())
+        if not tracks_df.empty and 'track_id' in tracks_df.columns:
+            track_data = tracks_df[tracks_df['track_id'] == track_id]
+            if not track_data.empty:
+                return {
+                    "id": track_id,
+                    "title": track_data.iloc[0].get('track_name', f"Track {track_id}"),
+                    "artist": track_data.iloc[0].get('artists', f"Artist for {track_id}"),
+                    "album": track_data.iloc[0].get('album_name', "Unknown Album"),
+                    "album_art": f"https://picsum.photos/seed/{track_id}/300/300"
+                }
+    
+    # If it looks like a MusicBrainz UUID (36 chars with hyphens)
+    if len(track_id) == 36 and track_id.count('-') == 4:
+        mb_details = get_track_details_from_musicbrainz(track_id)
+        if mb_details:
+            return mb_details
+    # Try ReccoBeats
     details = get_track_details_from_reccobeats(track_id)
     if details:
         return details
     
-    # Fall back to MusicBrainz
-    details = get_track_details_from_musicbrainz(track_id)
-    if details:
-        return details
-    
-    # Return simulated data if both APIs fail
+    # Return simulated data as last resort
     return {
         "id": track_id,
-        "title": f"Track {track_id}",
-        "artist": f"Artist for {track_id}",
-        "album": f"Album for {track_id}",
+        "title": f"Track {track_id[:8]}...",
+        "artist": f"Artist",
+        "album": "Unknown Album",
         "duration_ms": 180000,
         "album_art": f"https://picsum.photos/seed/{track_id}/300/300"
     }
@@ -1400,16 +1436,51 @@ def adaptive_recommendations(graph, latent_features):
 
 def generate_explanations(recommendations, graph):
     """
-    Simulate generating explanations (XAI) for each recommendation.
+    Generate more personalized explanations for recommendations.
     """
     explanations = {}
+    
+    # Define a variety of explanation templates
+    templates = [
+        "Based on your interest in {genre} music, we think you'll enjoy this {mood} track by {artist}.",
+        "Since you've been listening to artists like {similar_artist}, we recommend this {genre} track from {artist}.",
+        "This {mood} song by {artist} matches your listening patterns during {time_of_day}.",
+        "Fans of {similar_artist} also enjoy this {genre} track by {artist}.",
+        "This {genre} track by {artist} has similar audio characteristics to songs you frequently play."
+    ]
+    
+    # Define some mood and genre mappings for variety
+    moods = ["energetic", "relaxing", "upbeat", "mellow", "intense", "atmospheric"]
+    genres = ["pop", "rock", "electronic", "hip-hop", "indie", "jazz", "classical"]
+    times = ["morning", "afternoon", "evening", "late night"]
+    
     for user, track in recommendations.items():
         if track:
             artist = graph['track_to_artist'].get(track, "Unknown Artist")
-            explanations[user] = (
-                f"Based on your listening history, we think you'll enjoy this track by {artist}."
+            
+            # Get a random similar artist from the graph
+            similar_artists = [a for a in graph['nodes']['artists'] if a != artist]
+            similar_artist = random.choice(similar_artists) if similar_artists else "other artists you like"
+            
+            # Randomly select explanation elements
+            mood = random.choice(moods)
+            genre = random.choice(genres)
+            time_of_day = random.choice(times)
+            
+            # Choose a template and format it
+            template = random.choice(templates)
+            explanation = template.format(
+                artist=artist,
+                genre=genre,
+                mood=mood,
+                similar_artist=similar_artist,
+                time_of_day=time_of_day
             )
+            
+            explanations[user] = explanation
+    
     return explanations
+
 
 def compute_leaderboard(graph):
     """
@@ -1606,6 +1677,93 @@ def sidebar_navigation():
             st.session_state.current_page = "login"
             st.rerun()
 
+# Add these imports at the top of your file
+import base64
+from bs4 import BeautifulSoup
+from urllib.parse import quote_plus
+
+# Replace the existing get_preview_url function with this enhanced version
+def get_preview_url(track_id, track_name=None, artist=None):
+    """
+    Get a preview URL for a track using multiple fallback methods:
+    1. Try to fetch from Jamendo (free music API)
+    2. Try to find a YouTube video
+    3. Fall back to SoundHelix samples
+    
+    Returns a tuple: (url, source_type, embed_html)
+    where source_type is 'audio', 'youtube', or 'soundhelix'
+    """
+    # List of sample audio clips for fallback
+    sample_clips = [
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-4.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-5.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-6.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-7.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-8.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-9.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-10.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-11.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-12.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-13.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-14.mp3",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-15.mp3",
+    ]
+    
+    # Method 1: Try to fetch from Jamendo (free music API)
+    if track_name and artist:
+        try:
+            search_query = f"{track_name} {artist}"
+            jamendo_url = f"https://api.jamendo.com/v3.0/tracks/?client_id=56d30c95&format=json&limit=1&search={quote_plus(search_query)}"
+            response = requests.get(jamendo_url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('results') and len(data['results']) > 0:
+                    audio_url = data['results'][0].get('audio')
+                    if audio_url:
+                        return (audio_url, 'audio', None)
+        except Exception as e:
+            print(f"Error fetching from Jamendo: {e}")
+    
+    # Method 2: Try to find a YouTube video
+    if track_name and artist:
+        try:
+            search_query = f"{track_name} {artist} official audio"
+            search_url = f"https://www.youtube.com/results?search_query={quote_plus(search_query)}"
+            
+            response = requests.get(search_url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            })
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                # Look for video IDs in the page
+                scripts = soup.find_all('script')
+                for script in scripts:
+                    if 'videoId' in script.text:
+                        import re
+                        video_ids = re.findall(r'"videoId":"([^"]+)"', script.text)
+                        if video_ids:
+                            video_id = video_ids[0]
+                            embed_html = f"""
+                            <iframe width="100%" height="80" 
+                                src="https://www.youtube.com/embed/{video_id}?autoplay=1" 
+                                frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
+                                allowfullscreen>
+                            </iframe>
+                            """
+                            return (f"https://www.youtube.com/watch?v={video_id}", 'youtube', embed_html)
+        except Exception as e:
+            print(f"Error finding YouTube video: {e}")
+    
+    # Method 3: Fall back to SoundHelix samples
+    sample_index = int(hashlib.md5(str(track_id).encode()).hexdigest(), 16) % len(sample_clips)
+    return (sample_clips[sample_index], 'soundhelix', None)
+
+# Update the music_player function to use the new get_preview_url function
 def music_player():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Music Player")
@@ -1630,30 +1788,38 @@ def music_player():
             st.markdown(f"<h4>{playback_state['current_track_name'] or 'Unknown Track'}</h4>", unsafe_allow_html=True)
             st.write(f"Artist: {playback_state['current_artists'] or 'Unknown Artist'}")
         
-        # For demonstration, we'll use a static audio file
-        st.audio("https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3", format="audio/mp3")
+        # Get a preview URL based on the track ID and metadata
+        preview_url, source_type, embed_html = get_preview_url(
+            st.session_state.current_track,
+            playback_state['current_track_name'],
+            playback_state['current_artists']
+        )
+        
+        # Display appropriate player based on source type
+        if source_type == 'youtube' and embed_html:
+            st.components.v1.html(embed_html, height=80)
+            st.caption("Playing from YouTube")
+        else:
+            # For audio files (both Jamendo and SoundHelix)
+            st.audio(preview_url, format="audio/mp3")
+            if source_type == 'soundhelix':
+                st.caption("Playing sample audio (SoundHelix)")
+            else:
+                st.caption("Playing from Jamendo (Free Music)")
     else:
         st.markdown("<h4 style='text-align: center;'>No track selected</h4>", unsafe_allow_html=True)
-    
+
     # Player controls
-    cols = st.columns(7)
+    cols = st.columns(6)  # Reduced from 7 columns (removed play/pause)
     with cols[0]:
         if st.button("⏮️", key="prev"):
             skip_to_previous(st.session_state.user_id)
             st.rerun()
     with cols[1]:
-        if st.session_state.is_playing:
-            if st.button("⏸️", key="pause"):
-                pause_playback(st.session_state.user_id)
-                st.rerun()
-        else:
-            if st.button("▶️", key="play"):
-                start_playback(st.session_state.user_id)
-                st.rerun()
-    with cols[2]:
         if st.button("⏭️", key="next"):
             skip_to_next(st.session_state.user_id)
-    with cols[3]:
+            st.rerun()
+    with cols[2]:
         if st.button("❤️", key="like"):
             if st.session_state.current_track:
                 track_details = get_track_details(st.session_state.current_track)
@@ -1666,8 +1832,8 @@ def music_player():
                     track_details.get('album_art')
                 )
                 st.success("Added to favorites")
-    with cols[4]:
-        if st.button("➕", key="add"):
+    with cols[3]:
+        if st.button("➕", key="add_to_playlist"):
             if st.session_state.current_track:
                 st.session_state.add_to_playlist = True
                 st.session_state.add_track_id = st.session_state.current_track
@@ -1675,14 +1841,48 @@ def music_player():
                 st.session_state.add_track_name = track_details.get('title')
                 st.session_state.add_track_artist = track_details.get('artist')
                 st.session_state.add_track_album_art = track_details.get('album_art')
+    with cols[4]:
+        if st.button("📋", key="add_to_queue"):
+            if st.session_state.current_track:
+                track_details = get_track_details(st.session_state.current_track)
+                add_to_queue(
+                    st.session_state.user_id, 
+                    st.session_state.current_track,
+                    track_details.get('title'),
+                    track_details.get('artist'),
+                    track_details.get('album_art')
+                )
+                st.success("Added to queue")
     with cols[5]:
         volume = st.slider("Volume", 0, 100, int(playback_state['volume']), key="volume_slider")
         if volume != playback_state['volume']:
             set_volume(st.session_state.user_id, volume)
-    with cols[6]:
-        if st.button("🔄", key="shuffle"):
-            toggle_shuffle(st.session_state.user_id, not playback_state['shuffle'])
-            st.rerun()
+            
+            # Add JavaScript to actually control the volume of audio elements
+            volume_js = f"""
+            <script>
+                const audioElements = document.getElementsByTagName('audio');
+                for(let audio of audioElements) {{
+                    audio.volume = {volume/100};
+                }}
+                
+                // Also handle YouTube iframes if present
+                const iframes = document.getElementsByTagName('iframe');
+                for(let iframe of iframes) {{
+                    if(iframe.src.includes('youtube')) {{
+                        // Try to set YouTube volume via postMessage
+                        iframe.contentWindow.postMessage(
+                            JSON.stringify({{
+                                'event': 'command',
+                                'func': 'setVolume',
+                                'args': [{volume}]
+                            }}), '*'
+                        );
+                    }}
+                }}
+            </script>
+            """
+            st.components.v1.html(volume_js, height=0)
     
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -2042,12 +2242,14 @@ def library_page():
             playlist_name = st.text_input("Playlist Name")
             playlist_desc = st.text_area("Description (optional)")
             
-            if st.button("Create Playlist"):
+            # In library_page function
+            if st.button("Create Playlist", key="create_playlist_btn"):
                 if playlist_name:
                     playlist_id = create_playlist(st.session_state.user_id, playlist_name, playlist_desc)
                     st.success(f"Playlist '{playlist_name}' created successfully!")
                 else:
                     st.error("Please enter a playlist name")
+
         
         # List user's playlists
         playlists = get_user_playlists(st.session_state.user_id)
@@ -2340,18 +2542,17 @@ def profile_page():
         # Convert to DataFrame for plotting
         hours_df = pd.DataFrame(profile['listening_hours'])
         
-        # Create heatmap
-        fig = px.density_heatmap(
+        # Create a proper DataFrame with consistent dimensions
+        fig = px.bar(
             hours_df,
             x='hour',
-            y=['Plays'],
-            z='count',
-            color_continuous_scale='YlGnBu'
+            y='count',
+            title="Listening Activity by Hour",
+            color_discrete_sequence=["#00c9a7"]
         )
         fig.update_layout(
-            title="Listening Activity by Hour",
             xaxis_title="Hour of Day",
-            yaxis_title="",
+            yaxis_title="Number of Plays",
             paper_bgcolor="#1e1e1e",
             plot_bgcolor="#1e1e1e",
             font=dict(color="white")
@@ -2517,7 +2718,7 @@ def analytics_page():
         """, unsafe_allow_html=True)
         
         # Sample explanations
-        st.subheader("Sample Recommendation Explanations")
+        st.subheader("Recommendation Explanations")
         
         for user_id, explanation in list(st.session_state.ml_explanations.items())[:3]:
             track_id = st.session_state.ml_recommendations.get(user_id)
