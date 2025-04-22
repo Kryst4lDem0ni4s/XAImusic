@@ -708,14 +708,14 @@ def set_repeat_mode(user_id, mode):
 # -------------------------------
 # API INTEGRATION FUNCTIONS
 # -------------------------------
-def get_track_recommendations(artist_name=None, track_name=None, limit=10):
+def get_track_recommendations(artists=None, track_name=None, limit=10):
     """Get track recommendations from ReccoBeats API"""
     url = f"{RECCOBEATS_BASE_URL}/track/recommendation"
     
     params = {"limit": limit}
     
-    if artist_name:
-        params["artist_name"] = artist_name
+    if artists:
+        params["artists"] = artists
     
     if track_name:
         params["track_name"] = track_name
@@ -977,10 +977,10 @@ def preprocess_data(raw_data):
     context_df = raw_data['context'].dropna()
     tracks_df = raw_data['tracks'].dropna()
     
-    # Rename 'artists' column to 'artist_name' if it exists
-    if 'artists' in tracks_df.columns and 'artist_name' not in tracks_df.columns:
-        tracks_df['artist_name'] = tracks_df['artists']
-        print("Renamed 'artists' column to 'artist_name'")
+    # Rename 'artists' column to 'artists' if it exists
+    if 'artists' in tracks_df.columns and 'artists' not in tracks_df.columns:
+        tracks_df['artists'] = tracks_df['artists']
+        print("Renamed 'artists' column to 'artists'")
     
     # Merge interactions with context using nearest timestamp (within 1 minute tolerance)
     merged_df = pd.merge_asof(
@@ -992,12 +992,12 @@ def preprocess_data(raw_data):
         tolerance=pd.Timedelta("1min")
     )
     
-    # Merge with Spotify track metadata to obtain 'artist_name' and 'track_name'
-    if 'artist_name' in tracks_df.columns and 'track_name' in tracks_df.columns:
-        merged_df = pd.merge(merged_df, tracks_df[['track_id', 'artist_name', 'track_name']], on='track_id', how='left')
+    # Merge with Spotify track metadata to obtain 'artists' and 'track_name'
+    if 'artists' in tracks_df.columns and 'track_name' in tracks_df.columns:
+        merged_df = pd.merge(merged_df, tracks_df[['track_id', 'artists', 'track_name']], on='track_id', how='left')
     else:
         # Handle missing columns
-        required_columns = ['track_id', 'artist_name', 'track_name']
+        required_columns = ['track_id', 'artists', 'track_name']
         missing_columns = [col for col in required_columns if col not in tracks_df.columns]
         print(f"Missing columns in track data: {missing_columns}")
         
@@ -1005,7 +1005,7 @@ def preprocess_data(raw_data):
         for col in missing_columns:
             tracks_df[col] = f"Unknown {col.replace('_', ' ').title()}"
         
-        merged_df = pd.merge(merged_df, tracks_df[['track_id', 'artist_name', 'track_name']], on='track_id', how='left')
+        merged_df = pd.merge(merged_df, tracks_df[['track_id', 'artists', 'track_name']], on='track_id', how='left')
     
     # Compute session_id: start a new session if time difference > 5 minutes (300 sec)
     merged_df = merged_df.sort_values(['user_id', 'timestamp'])
@@ -1062,10 +1062,10 @@ def build_interaction_graph(processed_df, fused_features, track_metadata):
     """
     users = set(processed_df['user_id'].unique())
     tracks = set(processed_df['track_id'].unique())
-    artists = set(processed_df['artist_name'].unique())
+    artists = set(processed_df['artists'].unique())
     
     # Build track-to-artist mapping from the Spotify track metadata
-    track_to_artist = dict(zip(track_metadata['track_id'], track_metadata['artist_name']))
+    track_to_artist = dict(zip(track_metadata['track_id'], track_metadata['artists']))
     
     # Build edges: (user_id, track_id, weight) based on interaction action
     edges = []
@@ -2188,3 +2188,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
