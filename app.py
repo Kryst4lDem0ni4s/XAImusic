@@ -141,8 +141,89 @@ def setup_database():
     )
     ''')
     
+    # Create users table with karma_points column
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        karma_points INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # Check if karma_points column exists, add it if it doesn't
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [info[1] for info in cursor.fetchall()]
+    if 'karma_points' not in columns:
+        cursor.execute('ALTER TABLE users ADD COLUMN karma_points INTEGER DEFAULT 0')
+    
+    # Create karma_history table for tracking point changes
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS karma_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        points INTEGER NOT NULL,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id)
+    )
+    ''')
+    
     conn.commit()
     conn.close()
+
+def add_karma_points(user_id, action, points):
+    """Add karma points to a user and record in history"""
+    conn = sqlite3.connect('music_app.db')
+    cursor = conn.cursor()
+    
+    try:
+        # Update user's karma points
+        cursor.execute('UPDATE users SET karma_points = karma_points + ? WHERE id = ?', (points, user_id))
+        
+        # Record in karma history
+        cursor.execute('''
+        INSERT INTO karma_history (user_id, action, points)
+        VALUES (?, ?, ?)
+        ''', (user_id, action, points))
+        
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error adding karma points: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+def get_user_karma(user_id):
+    """Get a user's karma points and history"""
+    conn = sqlite3.connect('music_app.db')
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('SELECT karma_points FROM users WHERE id = ?', (user_id,))
+        result = cursor.fetchone()
+        karma = result[0] if result else 0
+        
+        # Get karma history
+        cursor.execute('''
+        SELECT action, points, timestamp FROM karma_history
+        WHERE user_id = ?
+        ORDER BY timestamp DESC LIMIT 10
+        ''', (user_id,))
+        
+        history = [{'action': row[0], 'points': row[1], 'timestamp': row[2]} for row in cursor.fetchall()]
+        
+        return {'total': karma, 'history': history}
+    except Exception as e:
+        print(f"Error getting karma: {e}")
+        return {'total': 0, 'history': []}
+    finally:
+        conn.close()
+
 
 # -------------------------------
 # USER MANAGEMENT FUNCTIONS
@@ -286,6 +367,8 @@ def create_playlist(user_id, name, description=""):
     conn.commit()
     conn.close()
     
+    add_karma_points(user_id, 'create_playlist', 10)
+    
     return playlist_id
 
 def add_track_to_playlist(playlist_id, track_id, user_id, track_name=None, artists=None, album_art=None):
@@ -324,6 +407,8 @@ def add_track_to_playlist(playlist_id, track_id, user_id, track_name=None, artis
     
     conn.commit()
     conn.close()
+    
+    add_karma_points(user_id, 'playlist_add', 3)
     
     return True, "Track added to playlist"
 
@@ -475,6 +560,13 @@ def toggle_favorite_track(user_id, track_id, favorite=True, track_name=None, art
     
     conn.commit()
     conn.close()
+    
+    if favorite:
+        # Add karma points for liking a track
+        add_karma_points(user_id, 'like', 5)
+    else:
+        # Remove karma points for unliking a track
+        add_karma_points(user_id, 'unlike', -2)
     
     return True, "Favorites updated successfully"
 
@@ -642,6 +734,8 @@ def start_playback(user_id, track_id=None, track_name=None, artists=None, album_
         
         conn.commit()
         conn.close()
+        
+        add_karma_points(user_id, 'play', 1)
     
     return update_playback_state(user_id, **update_data)
 
@@ -1833,14 +1927,16 @@ def music_player():
                 )
                 st.success("Added to favorites")
     with cols[3]:
-        if st.button("➕", key="add_to_playlist"):
+        if st.button("➕", key="add_to_playlist_btn"):
             if st.session_state.current_track:
-                st.session_state.add_to_playlist = True
-                st.session_state.add_track_id = st.session_state.current_track
                 track_details = get_track_details(st.session_state.current_track)
-                st.session_state.add_track_name = track_details.get('title')
-                st.session_state.add_track_artist = track_details.get('artist')
-                st.session_state.add_track_album_art = track_details.get('album_art')
+                # Use a different session state variable
+                st.session_state.show_playlist_modal = True
+                st.session_state.modal_track_id = st.session_state.current_track
+                st.session_state.modal_track_name = track_details.get('title')
+                st.session_state.modal_track_artist = track_details.get('artist')
+                st.session_state.modal_track_album_art = track_details.get('album_art')
+                st.rerun()
     with cols[4]:
         if st.button("📋", key="add_to_queue"):
             if st.session_state.current_track:
@@ -1885,6 +1981,126 @@ def music_player():
             st.components.v1.html(volume_js, height=0)
     
     st.markdown('</div>', unsafe_allow_html=True)
+
+def load_ml_data_for_user(user_id):
+    """Load ML data specifically for a user, combining pipeline data with user activity"""
+    # First, load the general ML data
+    raw_data = ingest_data(spotify_filename="spotify_data.csv", num_interactions=100)
+    processed_data = preprocess_data(raw_data)
+    
+    # Extract audio features and other ML components
+    track_metadata = raw_data['tracks']
+    audio_features = extract_audio_features(track_metadata)
+    fused_features = fuse_features(audio_features, raw_data['context'])
+    latent_features = extract_latent_features(fused_features)
+    
+    # Now, get user-specific listening data
+    conn = sqlite3.connect('music_app.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT track_id, action, timestamp
+    FROM user_listening_data
+    WHERE user_id = ?
+    ORDER BY timestamp DESC
+    ''', (user_id,))
+    
+    user_interactions = cursor.fetchall()
+    conn.close()
+    
+    # Convert to DataFrame format similar to the pipeline's
+    if user_interactions:
+        user_df = pd.DataFrame(user_interactions, columns=['track_id', 'action', 'timestamp'])
+        
+        # Merge with track metadata
+        user_processed = pd.merge(user_df, track_metadata[['track_id', 'artists', 'track_name']], 
+                                 on='track_id', how='left')
+        
+        # Combine with the general processed data, prioritizing user's data
+        combined_df = pd.concat([user_processed, processed_data]).drop_duplicates(subset=['track_id', 'action'], keep='first')
+    else:
+        combined_df = processed_data
+    
+    # Build interaction graph with the combined data
+    interaction_graph = build_interaction_graph(combined_df, fused_features, track_metadata)
+    
+    # Generate personalized recommendations
+    recommendations = adaptive_recommendations(interaction_graph, latent_features)
+    explanations = generate_explanations(recommendations, interaction_graph)
+    
+    return {
+        'processed_data': combined_df,
+        'interaction_graph': interaction_graph,
+        'recommendations': recommendations,
+        'explanations': explanations,
+        'audio_features': audio_features,
+        'track_metadata': track_metadata
+    }
+
+def get_user_audio_features_analysis(user_id):
+    """Get audio feature analysis specific to a user's listening patterns"""
+    conn = sqlite3.connect('music_app.db')
+    cursor = conn.cursor()
+    
+    try:
+        # Get the user's most played tracks
+        cursor.execute('''
+        SELECT track_id, COUNT(*) as play_count
+        FROM user_listening_data
+        WHERE user_id = ? AND action = 'play'
+        GROUP BY track_id
+        ORDER BY play_count DESC
+        LIMIT 50
+        ''', (user_id,))
+        
+        user_tracks = cursor.fetchall()
+        track_ids = [row[0] for row in user_tracks]
+        
+        # If we have ML data loaded
+        if hasattr(st.session_state, 'user_data') and st.session_state.user_data:
+            tracks_df = st.session_state.user_data.get('tracks', pd.DataFrame())
+            
+            if not tracks_df.empty:
+                # Filter for user's tracks
+                user_tracks_df = tracks_df[tracks_df['track_id'].isin(track_ids)]
+                
+                # Select audio features to analyze
+                audio_features = ['danceability', 'energy', 'acousticness', 
+                                 'instrumentalness', 'liveness', 'valence']
+                
+                # Check which features are available
+                available_features = [f for f in audio_features if f in user_tracks_df.columns]
+                
+                if available_features:
+                    # Calculate average features for user's tracks
+                    user_avg_features = {}
+                    for feature in available_features:
+                        user_avg_features[feature] = user_tracks_df[feature].mean()
+                    
+                    # Calculate overall average for comparison
+                    overall_avg_features = {}
+                    for feature in available_features:
+                        overall_avg_features[feature] = tracks_df[feature].mean()
+                    
+                    # Get feature distributions for user's tracks
+                    feature_distributions = {}
+                    for feature in available_features:
+                        feature_distributions[feature] = user_tracks_df[feature].tolist()
+                    
+                    return {
+                        'user_avg_features': user_avg_features,
+                        'overall_avg_features': overall_avg_features,
+                        'feature_distributions': feature_distributions,
+                        'available_features': available_features
+                    }
+        
+        # If we couldn't get data from ML pipeline
+        return None
+    except Exception as e:
+        print(f"Error getting user audio features analysis: {e}")
+        return None
+    finally:
+        conn.close()
 
 def load_ml_data():
     """Load machine learning data and generate recommendations"""
@@ -2503,12 +2719,13 @@ def playlist_page():
     
     # Display music player
     music_player()
-
+    
 def profile_page():
     st.title("Your Profile")
     
-    # Get user profile
+    # Get user profile and karma
     profile = get_user_profile(st.session_state.user_id)
+    karma = get_user_karma(st.session_state.user_id)
     
     if not profile:
         st.error("Could not load profile")
@@ -2524,12 +2741,205 @@ def profile_page():
         st.write(f"Email: {profile['email']}")
         st.write(f"Member since: {profile['created_at']}")
         
+        # Display karma points prominently
         st.markdown(f"""
-        <div class="card">
-            <p>{len(profile['playlists'])} playlists</p>
-            <p>{len(profile['favorites'])} favorite tracks</p>
+        <div class="card" style="background-color: #2a2a2a; padding: 15px; border-radius: 10px; margin-top: 10px;">
+            <h3 style="color: #00c9a7; margin: 0;">Karma Points: {karma['total']}</h3>
+            <div style="background-color: #333; height: 10px; border-radius: 5px; margin-top: 10px; overflow: hidden;">
+                <div style="background-color: #00c9a7; height: 100%; width: {min(karma['total']/1000*100, 100)}%;"></div>
+            </div>
+            <p style="margin-top: 5px; font-size: 12px;">Level {karma['total'] // 100 + 1} • {karma['total'] % 100}/100 to next level</p>
         </div>
         """, unsafe_allow_html=True)
+    
+    # Display karma history
+    st.subheader("Recent Karma Activity")
+    
+    if karma['history']:
+        for item in karma['history']:
+            action_emoji = "🎵" if item['action'] == 'play' else "❤️" if item['action'] == 'like' else "📋" if item['action'] == 'playlist_add' else "📝" if item['action'] == 'create_playlist' else "🔄"
+            st.markdown(f"""
+            <div style="display: flex; align-items: center; margin-bottom: 5px;">
+                <div style="width: 30px; text-align: center; font-size: 20px;">{action_emoji}</div>
+                <div style="flex-grow: 1; padding-left: 10px;">
+                    <span>{item['action'].replace('_', ' ').title()}</span>
+                    <span style="color: #aaa; font-size: 12px; margin-left: 10px;">{item['timestamp']}</span>
+                </div>
+                <div style="color: {'#00c9a7' if item['points'] > 0 else '#ff6b6b'}; font-weight: bold;">
+                    {'+' if item['points'] > 0 else ''}{item['points']}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("No karma activity yet. Start interacting with music to earn points!")
+    
+    # User's listening stats
+    st.subheader("Your Listening Stats")
+    
+    # Get user-specific audio feature analysis
+    audio_analysis = get_user_audio_features_analysis(st.session_state.user_id)
+    
+    if audio_analysis and audio_analysis['available_features']:
+        # Create comparison chart of user's preferences vs overall average
+        features = audio_analysis['available_features']
+        user_values = [audio_analysis['user_avg_features'][f] for f in features]
+        overall_values = [audio_analysis['overall_avg_features'][f] for f in features]
+        
+        comparison_df = pd.DataFrame({
+            'Feature': features,
+            'Your Average': user_values,
+            'Overall Average': overall_values
+        })
+        
+        fig = px.bar(
+            comparison_df, 
+            x='Feature', 
+            y=['Your Average', 'Overall Average'],
+            barmode='group',
+            title="Your Music Preferences vs Average",
+            color_discrete_sequence=["#00c9a7", "#ff6b6b"]
+        )
+        fig.update_layout(
+            paper_bgcolor="#1e1e1e",
+            plot_bgcolor="#1e1e1e",
+            font=dict(color="white")
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Add explanation of what this means
+        st.markdown("""
+        <div class="card">
+            <h4>What This Means:</h4>
+            <p>This chart shows how your music preferences compare to the average user. Higher values in features like:</p>
+            <ul>
+                <li><b>Danceability</b>: You prefer more danceable tracks</li>
+                <li><b>Energy</b>: You prefer more energetic, intense music</li>
+                <li><b>Acousticness</b>: You prefer more acoustic, less electronic sounds</li>
+                <li><b>Valence</b>: You prefer more positive, happy music</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    load_ml_data()
+    
+    # Create listening activity chart
+    if profile.get('listening_hours'):
+        # Convert to DataFrame for plotting
+        hours_df = pd.DataFrame(profile['listening_hours'])
+        
+        # Create a proper DataFrame with consistent dimensions
+        fig = px.bar(
+            hours_df,
+            x='hour',
+            y='count',
+            title="Listening Activity by Hour",
+            color_discrete_sequence=["#00c9a7"]
+        )
+        fig.update_layout(
+            xaxis_title="Hour of Day",
+            yaxis_title="Number of Plays",
+            paper_bgcolor="#1e1e1e",
+            plot_bgcolor="#1e1e1e",
+            font=dict(color="white")
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Account settings
+    st.header("Account Settings")
+    
+    with st.expander("Change Password"):
+        current_password = st.text_input("Current Password", type="password", key="current_pwd")
+        new_password = st.text_input("New Password", type="password", key="new_pwd")
+        confirm_password = st.text_input("Confirm New Password", type="password", key="confirm_pwd")
+        
+        if st.button("Update Password"):
+            if not current_password or not new_password or not confirm_password:
+                st.error("Please fill in all fields")
+            elif new_password != confirm_password:
+                st.error("New passwords do not match")
+            else:
+                # Verify current password
+                conn = sqlite3.connect('music_app.db')
+                cursor = conn.cursor()
+                
+                cursor.execute('SELECT password_hash FROM users WHERE id = ?', (st.session_state.user_id,))
+                stored_password = cursor.fetchone()[0]
+                
+                salt, hash_value = stored_password.split(':')
+                computed_hash = hashlib.sha256((current_password + salt).encode()).hexdigest()
+                
+                if computed_hash != hash_value:
+                    st.error("Current password is incorrect")
+                else:
+                    # Update password
+                    new_salt = secrets.token_hex(16)
+                    new_hash = hashlib.sha256((new_password + new_salt).encode()).hexdigest()
+                    
+                    cursor.execute(
+                        'UPDATE users SET password_hash = ? WHERE id = ?',
+                        (f"{new_salt}:{new_hash}", st.session_state.user_id)
+                    )
+                    
+                    conn.commit()
+                    st.success("Password updated successfully")
+                
+                conn.close()
+    
+    # Display music player
+    music_player()
+
+def profile_page():
+    st.title("Your Profile")
+    
+    # Get user profile and karma
+    profile = get_user_profile(st.session_state.user_id)
+    karma = get_user_karma(st.session_state.user_id)
+    
+    if not profile:
+        st.error("Could not load profile")
+        return
+    
+    col1, col2 = st.columns([1, 3])
+    
+    with col1:
+        st.image("https://i.pravatar.cc/150?u=" + profile['username'], width=150)
+    
+    with col2:
+        st.markdown(f"<h2>{profile['username']}</h2>", unsafe_allow_html=True)
+        st.write(f"Email: {profile['email']}")
+        st.write(f"Member since: {profile['created_at']}")
+        
+        # Display karma points prominently
+        st.markdown(f"""
+        <div class="card" style="background-color: #2a2a2a; padding: 15px; border-radius: 10px; margin-top: 10px;">
+            <h3 style="color: #00c9a7; margin: 0;">Karma Points: {karma['total']}</h3>
+            <div style="background-color: #333; height: 10px; border-radius: 5px; margin-top: 10px; overflow: hidden;">
+                <div style="background-color: #00c9a7; height: 100%; width: {min(karma['total']/1000*100, 100)}%;"></div>
+            </div>
+            <p style="margin-top: 5px; font-size: 12px;">Level {karma['total'] // 100 + 1} • {karma['total'] % 100}/100 to next level</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Display karma history
+    st.subheader("Recent Karma Activity")
+    
+    if karma['history']:
+        for item in karma['history']:
+            action_emoji = "🎵" if item['action'] == 'play' else "❤️" if item['action'] == 'like' else "📋" if item['action'] == 'playlist_add' else "📝" if item['action'] == 'create_playlist' else "🔄"
+            st.markdown(f"""
+            <div style="display: flex; align-items: center; margin-bottom: 5px;">
+                <div style="width: 30px; text-align: center; font-size: 20px;">{action_emoji}</div>
+                <div style="flex-grow: 1; padding-left: 10px;">
+                    <span>{item['action'].replace('_', ' ').title()}</span>
+                    <span style="color: #aaa; font-size: 12px; margin-left: 10px;">{item['timestamp']}</span>
+                </div>
+                <div style="color: {'#00c9a7' if item['points'] > 0 else '#ff6b6b'}; font-weight: bold;">
+                    {'+' if item['points'] > 0 else ''}{item['points']}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("No karma activity yet. Start interacting with music to earn points!")
     
     # User stats and activity
     st.header("Your Listening Stats")
@@ -2602,6 +3012,131 @@ def profile_page():
     
     # Display music player
     music_player()
+    
+def get_artist_engagement_data(user_id=None):
+    """
+    Get artist engagement data based on actual user activity
+    If user_id is provided, get data for that user only
+    Otherwise, get aggregate data for all users
+    """
+    conn = sqlite3.connect('music_app.db')
+    cursor = conn.cursor()
+    
+    try:
+        # Define the base query
+        query = '''
+        SELECT p.artists, COUNT(*) as play_count,
+               SUM(CASE WHEN l.action = 'play' THEN 1 ELSE 0 END) as plays,
+               SUM(CASE WHEN l.action = 'like' THEN 1 ELSE 0 END) as likes,
+               SUM(CASE WHEN l.action = 'playlist_add' THEN 1 ELSE 0 END) as playlist_adds,
+               SUM(CASE WHEN l.action = 'skip' THEN 1 ELSE 0 END) as skips
+        FROM user_listening_data l
+        JOIN recently_played p ON l.track_id = p.track_id
+        '''
+        
+        # Add user filter if specified
+        if user_id:
+            query += ' WHERE l.user_id = ?'
+            params = (user_id,)
+        else:
+            params = ()
+            
+        query += ' GROUP BY p.artists ORDER BY play_count DESC LIMIT 10'
+        
+        cursor.execute(query, params)
+        results = cursor.fetchall()
+        
+        # Calculate engagement score: plays + (likes * 1.5) + (playlist_adds * 1.2) - (skips * 0.5)
+        engagement_data = []
+        for row in results:
+            artist = row[0]
+            plays = row[2]
+            likes = row[3]
+            playlist_adds = row[4]
+            skips = row[5]
+            
+            engagement_score = plays + (likes * 1.5) + (playlist_adds * 1.2) - (skips * 0.5)
+            
+            engagement_data.append({
+                'artist': artist,
+                'engagement_score': engagement_score,
+                'plays': plays,
+                'likes': likes,
+                'playlist_adds': playlist_adds,
+                'skips': skips
+            })
+        
+        return engagement_data
+    except Exception as e:
+        print(f"Error getting artist engagement data: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_user_interaction_analysis(user_id=None):
+    """
+    Get user interaction analysis based on actual activity
+    If user_id is provided, get data for that user only
+    Otherwise, get aggregate data for all users
+    """
+    conn = sqlite3.connect('music_app.db')
+    cursor = conn.cursor()
+    
+    try:
+        # Get action counts
+        if user_id:
+            cursor.execute('''
+            SELECT action, COUNT(*) as count
+            FROM user_listening_data
+            WHERE user_id = ?
+            GROUP BY action
+            ''', (user_id,))
+        else:
+            cursor.execute('''
+            SELECT action, COUNT(*) as count
+            FROM user_listening_data
+            GROUP BY action
+            ''')
+        
+        action_counts = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        # Get hourly activity
+        if user_id:
+            cursor.execute('''
+            SELECT hour, COUNT(*) as count
+            FROM user_listening_data
+            WHERE user_id = ?
+            GROUP BY hour
+            ORDER BY hour
+            ''', (user_id,))
+        else:
+            cursor.execute('''
+            SELECT hour, COUNT(*) as count
+            FROM user_listening_data
+            GROUP BY hour
+            ORDER BY hour
+            ''')
+        
+        hourly_activity = []
+        for hour in range(24):
+            found = False
+            for row in cursor.fetchall():
+                if row[0] == hour:
+                    hourly_activity.append({'hour': hour, 'count': row[1]})
+                    found = True
+                    break
+            if not found:
+                hourly_activity.append({'hour': hour, 'count': 0})
+        
+        return {
+            'action_counts': action_counts,
+            'hourly_activity': hourly_activity
+        }
+    except Exception as e:
+        print(f"Error getting user interaction analysis: {e}")
+        return {'action_counts': {}, 'hourly_activity': []}
+    finally:
+        conn.close()
 
 def analytics_page():
     st.title("Music Analytics Dashboard")
@@ -2613,33 +3148,49 @@ def analytics_page():
         st.info("Loading recommendation engine data...")
         return
     
-    # Artist Leaderboard
+    # Artist Leaderboard with improved visualization
     st.header("Artist Leaderboard")
     
     if st.session_state.ml_interaction_graph:
         leaderboard = compute_leaderboard(st.session_state.ml_interaction_graph)
         
-        # Create a DataFrame for the leaderboard
-        leaderboard_df = pd.DataFrame(leaderboard[:10], columns=['Artist', 'Score'])
+        # Create a more meaningful DataFrame for the leaderboard
+        leaderboard_df = pd.DataFrame(leaderboard[:10], columns=['Artist', 'Engagement Score'])
         
-        # Create a bar chart
+        # Add engagement metrics explanation
+        st.markdown("""
+        <div class="card">
+            <p>The <b>Engagement Score</b> is calculated based on multiple factors:</p>
+            <ul>
+                <li>Play count (1.0 points per play)</li>
+                <li>Like actions (1.5 points per like)</li>
+                <li>Playlist additions (1.2 points per add)</li>
+                <li>Skip actions (-0.5 points per skip)</li>
+            </ul>
+            <p>Higher scores indicate stronger user engagement with the artist.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Create a more visually appealing bar chart
         fig = px.bar(
             leaderboard_df,
             x='Artist',
-            y='Score',
-            title="Top Artists by Interaction Score",
-            color='Score',
-            color_continuous_scale='Viridis'
+            y='Engagement Score',
+            title="Top Artists by User Engagement",
+            color='Engagement Score',
+            color_continuous_scale='Viridis',
+            labels={'Engagement Score': 'User Engagement Score'}
         )
         fig.update_layout(
             xaxis_title="Artist",
-            yaxis_title="Interaction Score",
+            yaxis_title="Engagement Score",
             paper_bgcolor="#1e1e1e",
             plot_bgcolor="#1e1e1e",
-            font=dict(color="white")
+            font=dict(color="white"),
+            xaxis=dict(tickangle=-45)
         )
         st.plotly_chart(fig, use_container_width=True)
-    
+
     # User Interaction Analysis
     st.header("User Interaction Analysis")
     
@@ -2670,34 +3221,127 @@ def analytics_page():
         # Select audio features to analyze
         audio_features = ['danceability', 'energy', 'acousticness', 'instrumentalness', 'valence']
         
-        # Filter tracks with these features
-        feature_data = []
-        for feature in audio_features:
-            if feature in track_metadata.columns:
-                feature_data.append({
-                    'Feature': feature.capitalize(),
-                    'Average': track_metadata[feature].mean()
-                })
+        # Check if these features exist in the dataset
+        available_features = [f for f in audio_features if f in track_metadata.columns]
         
-        if feature_data:
-            feature_df = pd.DataFrame(feature_data)
+        if available_features:
+            # Create tabs for different visualizations
+            feature_tabs = st.tabs(["Average Features", "Feature Distribution", "Feature Correlation"])
             
-            fig = px.bar(
-                feature_df,
-                x='Feature',
-                y='Average',
-                title="Average Audio Features",
-                color='Feature',
-                color_discrete_sequence=["#00c9a7", "#ff6b6b", "#feca57", "#5f27cd", "#48dbfb"]
-            )
-            fig.update_layout(
-                xaxis_title="Audio Feature",
-                yaxis_title="Average Value (0-1)",
-                paper_bgcolor="#1e1e1e",
-                plot_bgcolor="#1e1e1e",
-                font=dict(color="white")
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            with feature_tabs[0]:
+                # Calculate average features
+                feature_data = []
+                for feature in available_features:
+                    feature_data.append({
+                        'Feature': feature.capitalize(),
+                        'Average': track_metadata[feature].mean()
+                    })
+                
+                feature_df = pd.DataFrame(feature_data)
+                
+                # Create bar chart
+                fig = px.bar(
+                    feature_df,
+                    x='Feature',
+                    y='Average',
+                    title="Average Audio Features in Your Music",
+                    color='Feature',
+                    color_discrete_sequence=["#00c9a7", "#ff6b6b", "#feca57", "#5f27cd", "#48dbfb"]
+                )
+                fig.update_layout(
+                    xaxis_title="Audio Feature",
+                    yaxis_title="Average Value (0-1)",
+                    paper_bgcolor="#1e1e1e",
+                    plot_bgcolor="#1e1e1e",
+                    font=dict(color="white")
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Add explanation
+                st.markdown("""
+                <div class="card">
+                    <h4>Understanding Audio Features:</h4>
+                    <ul>
+                        <li><b>Danceability</b>: How suitable a track is for dancing (0.0 = least danceable, 1.0 = most danceable)</li>
+                        <li><b>Energy</b>: Perceptual measure of intensity and activity (0.0 = calm, 1.0 = energetic)</li>
+                        <li><b>Acousticness</b>: Confidence measure of whether the track is acoustic (1.0 = high confidence)</li>
+                        <li><b>Instrumentalness</b>: Predicts whether a track contains no vocals (1.0 = instrumental)</li>
+                        <li><b>Valence</b>: Musical positiveness conveyed by a track (0.0 = negative, 1.0 = positive)</li>
+                    </ul>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with feature_tabs[1]:
+                # Create distribution plots
+                selected_feature = st.selectbox(
+                    "Select feature to analyze:",
+                    options=available_features,
+                    format_func=lambda x: x.capitalize()
+                )
+                
+                # Create histogram
+                fig = px.histogram(
+                    track_metadata, 
+                    x=selected_feature,
+                    nbins=20,
+                    color_discrete_sequence=["#00c9a7"],
+                    title=f"Distribution of {selected_feature.capitalize()} Values"
+                )
+                fig.update_layout(
+                    xaxis_title=selected_feature.capitalize(),
+                    yaxis_title="Number of Tracks",
+                    paper_bgcolor="#1e1e1e",
+                    plot_bgcolor="#1e1e1e",
+                    font=dict(color="white")
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Show statistics
+                stats = track_metadata[selected_feature].describe()
+                st.markdown(f"""
+                <div class="card">
+                    <h4>Statistics for {selected_feature.capitalize()}:</h4>
+                    <p>Mean: {stats['mean']:.3f}</p>
+                    <p>Median: {stats['50%']:.3f}</p>
+                    <p>Standard Deviation: {stats['std']:.3f}</p>
+                    <p>Min: {stats['min']:.3f}</p>
+                    <p>Max: {stats['max']:.3f}</p>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with feature_tabs[2]:
+                # Create correlation matrix for audio features
+                corr_matrix = track_metadata[available_features].corr()
+                
+                # Create heatmap
+                fig = px.imshow(
+                    corr_matrix,
+                    text_auto=True,
+                    color_continuous_scale='Viridis',
+                    title="Correlation Between Audio Features"
+                )
+                fig.update_layout(
+                    paper_bgcolor="#1e1e1e",
+                    plot_bgcolor="#1e1e1e",
+                    font=dict(color="white")
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Explain correlations
+                st.markdown("""
+                <div class="card">
+                    <h4>Understanding Feature Correlations:</h4>
+                    <p>This heatmap shows how different audio features relate to each other:</p>
+                    <ul>
+                        <li>Values close to 1 indicate strong positive correlation (features increase together)</li>
+                        <li>Values close to -1 indicate strong negative correlation (one increases as the other decreases)</li>
+                        <li>Values close to 0 indicate little to no correlation</li>
+                    </ul>
+                    <p>For example, energy and acousticness often have a negative correlation, as energetic tracks tend to be less acoustic.</p>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.warning("No audio features found in the dataset. Please load a dataset with audio features.")
     
     # Recommendation Insights
     st.header("Recommendation Insights")
@@ -2735,9 +3379,8 @@ def analytics_page():
     # Display music player
     music_player()
 
-# Add to playlist modal
 def add_to_playlist_modal():
-    if 'add_to_playlist' in st.session_state and st.session_state.add_to_playlist:
+    if 'show_playlist_modal' in st.session_state and st.session_state.show_playlist_modal:
         st.subheader("Add to Playlist")
         
         # Get user's playlists
@@ -2746,16 +3389,17 @@ def add_to_playlist_modal():
         if playlists:
             playlist_id = st.selectbox("Select Playlist", 
                                       options=[p['id'] for p in playlists],
-                                      format_func=lambda x: next((p['name'] for p in playlists if p['id'] == x), ""))
+                                      format_func=lambda x: next((p['name'] for p in playlists if p['id'] == x), ""),
+                                      key="playlist_select")
             
-            if st.button("Add"):
+            if st.button("Add", key="confirm_add_to_playlist"):
                 success, message = add_track_to_playlist(
                     playlist_id, 
-                    st.session_state.add_track_id, 
+                    st.session_state.modal_track_id, 
                     st.session_state.user_id,
-                    st.session_state.add_track_name if 'add_track_name' in st.session_state else None,
-                    st.session_state.add_track_artist if 'add_track_artist' in st.session_state else None,
-                    st.session_state.add_track_album_art if 'add_track_album_art' in st.session_state else None
+                    st.session_state.modal_track_name,
+                    st.session_state.modal_track_artist,
+                    st.session_state.modal_track_album_art
                 )
                 if success:
                     st.success(message)
@@ -2763,28 +3407,15 @@ def add_to_playlist_modal():
                     st.error(message)
                 
                 # Reset modal state
-                st.session_state.add_to_playlist = False
-                for key in ['add_track_id', 'add_track_name', 'add_track_artist', 'add_track_album_art']:
+                st.session_state.show_playlist_modal = False
+                for key in ['modal_track_id', 'modal_track_name', 'modal_track_artist', 'modal_track_album_art']:
                     if key in st.session_state:
                         del st.session_state[key]
                 st.rerun()
             
-            if st.button("Cancel"):
-                st.session_state.add_to_playlist = False
-                for key in ['add_track_id', 'add_track_name', 'add_track_artist', 'add_track_album_art']:
-                    if key in st.session_state:
-                        del st.session_state[key]
-                st.rerun()
-        else:
-            st.info("You don't have any playlists. Create one first!")
-            
-            if st.button("Create Playlist"):
-                st.session_state.current_page = "library"
-                st.rerun()
-            
-            if st.button("Cancel"):
-                st.session_state.add_to_playlist = False
-                for key in ['add_track_id', 'add_track_name', 'add_track_artist', 'add_track_album_art']:
+            if st.button("Cancel", key="cancel_add_to_playlist"):
+                st.session_state.show_playlist_modal = False
+                for key in ['modal_track_id', 'modal_track_name', 'modal_track_artist', 'modal_track_album_art']:
                     if key in st.session_state:
                         del st.session_state[key]
                 st.rerun()
@@ -2800,7 +3431,7 @@ def main():
     sidebar_navigation()
     
     # Check for add to playlist modal
-    if 'add_to_playlist' in st.session_state and st.session_state.add_to_playlist:
+    if 'show_playlist_modal' in st.session_state and st.session_state.show_playlist_modal:
         add_to_playlist_modal()
     
     # Show current page
